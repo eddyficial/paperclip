@@ -169,6 +169,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/]+\/email\/deliveries\/[^/]+$/ },
   { method: "POST", path: /^\/api\/companies\/[^/]+\/email\/send$/ },
 
+  // An agent's message to its own chat endpoint owner. The controller requires
+  // an agent run and resolves the recipient; the caller cannot choose one.
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/chat-owner-notifications$/ },
+
   // Issue lifecycle: read context, checkout, update, comment, document, release
   { method: "GET", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/heartbeat-context$/ },

@@ -10,6 +10,7 @@ const contextRequests = [
   { method: "GET", path: "/api/companies/company-1/skills/skill-1/files", query: "?path=references%2Fworkflow.md" },
   { method: "GET", path: "/api/issues/task-1/diagnostics/wakes" },
   { method: "POST", path: "/api/issues/task-1/monitor/check-now" },
+  { method: "POST", path: "/api/companies/company-1/chat-owner-notifications" },
 ];
 
 const deniedRequests = [
@@ -25,6 +26,8 @@ const deniedRequests = [
   { method: "GET", path: "/api/issues/task-1/monitor/check-now" },
   { method: "POST", path: "/api/issues/task-1/monitor/check-now/extra" },
   { method: "POST", path: "/api/issues/task-1/recovery-actions/resolve" },
+  { method: "GET", path: "/api/companies/company-1/chat-owner-notifications" },
+  { method: "POST", path: "/api/companies/company-1/chat-owner-notifications/extra" },
 ];
 
 describe.each([
