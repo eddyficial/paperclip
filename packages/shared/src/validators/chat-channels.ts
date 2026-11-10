@@ -199,6 +199,14 @@ export const publishChatPublicationSchema = z.union([
   publishChatBoardMessageSchema,
 ]);
 
+/** An agent's own message to the person who sponsors its chat endpoint. */
+export const notifyChatOwnerSchema = z
+  .object({
+    body: multilineTextSchema.pipe(z.string().trim().min(1).max(100_000)),
+    idempotencyKey: z.string().trim().min(16).max(200),
+  })
+  .strict();
+
 export const resolveChatPublicationSchema = z
   .object({
     action: z.enum(["mark_delivered", "retry_anyway", "cancel"]),

@@ -3531,7 +3531,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   const { replayPublication, resolvePublication, resolveProviderEffect } = createChatPublicationResolution(db, { endpointRecord, withCredentialMutationLease, teamsTransferProtocol, commitTaskControlCompletion, processPendingPublications, processProviderEffect });
   const { prepareTeamsBoardSend } = createTeamsBoardSendPreparation(db, { endpointRecord, runtimeFor });
-  const { getPublicationBatchStatus, publishComment, publishBoardMessage } = createChatPublicationRequests(db, { endpointRecord, stageTeamsBoardFileIntent, processPendingSlackBoardMessages, processPendingPublications, prepareTeamsBoardSend });
+  const { getPublicationBatchStatus, publishComment, publishBoardMessage, publishAgentOwnerNotification } = createChatPublicationRequests(db, { endpointRecord, stageTeamsBoardFileIntent, processPendingSlackBoardMessages, processPendingPublications, prepareTeamsBoardSend });
 return {
     registerInteractionContinuationWork,
     registerGitHubReviewCheckWork: githubReviewCheckService(db, fetchImpl).registerCheckWork,
@@ -3586,6 +3586,7 @@ return {
     publishComment,
     getPublicationBatchStatus,
     publishBoardMessage,
+    publishAgentOwnerNotification,
     reconcileProviderRuntimes,
     processPendingPublications,
     enqueueInboundWakeupPublications,

@@ -22,6 +22,7 @@ import {
   createChatEndpointSchema,
   createChatIdentityLinkIntentSchema,
   isUuidLike,
+  notifyChatOwnerSchema,
   publishChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   gitHubRepositoryPageQuerySchema,
@@ -646,6 +647,28 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
         userId,
       );
       res.status(204).end();
+    },
+  );
+
+  router.post(
+    "/companies/:companyId/chat-owner-notifications",
+    validate(notifyChatOwnerSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoardOrAgent(req);
+      assertCompanyAccess(req, companyId);
+      if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.runId) {
+        throw forbidden("Owner notifications require an authenticated agent run");
+      }
+      res.status(201).json(
+        await service.publishAgentOwnerNotification({
+          companyId,
+          agentId: req.actor.agentId,
+          runId: req.actor.runId,
+          body: req.body.body,
+          idempotencyKey: req.body.idempotencyKey,
+        }),
+      );
     },
   );
 

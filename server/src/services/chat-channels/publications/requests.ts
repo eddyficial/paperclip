@@ -2,13 +2,13 @@ import { publicationTransportOrderKey } from "./order.js";
 import { publicationSummary } from "../activity.js";
 import { fileTransferProjectionColumns } from "../microsoft-teams/file-transfer-projection.js";
 import { notifyChatPublicationWork } from "../../chat-work-notifications.js";
-import { and, asc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, like, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { assets, chatActions, chatConversations, chatPublications, chatTeamsFileTransfers, issueComments, issueAttachments } from "@paperclipai/db";
+import { assets, chatActions, chatConversations, chatEndpoints, chatExternalPrincipals, chatIdentityLinks, chatPublications, chatTeamsFileTransfers, issueComments, issueAttachments } from "@paperclipai/db";
 import type { ChatPublicationBatchStatus } from "@paperclipai/shared";
 import { isUuidLike } from "@paperclipai/shared";
 import { projectChatFileTransfer, projectChatPublicationBatch } from "../../chat-publication-batches.js";
-import { badRequest, HttpError, conflict, notFound } from "../../../errors.js";
+import { badRequest, HttpError, conflict, notFound, tooManyRequests } from "../../../errors.js";
 import { logActivity } from "../../activity-log.js";
 import { issueService } from "../../issues.js";
 import { projectSafeChatPublication } from "../../chat-publication-projection.js";
@@ -25,6 +25,11 @@ type RequestOptions = {
   processPendingPublications: ReturnType<typeof createChatPublicationQueue>["processPendingPublications"];
   prepareTeamsBoardSend: ReturnType<typeof createTeamsBoardSendPreparation>["prepareTeamsBoardSend"];
 };
+// The "explicit:" prefix keeps these out of run-scoped reply handling: the agent
+// addressed this message to its owner, so it is not a reply to any chat turn.
+const AGENT_OWNER_NOTIFICATION_KEY_PREFIX = "explicit:agent-owner:";
+const AGENT_OWNER_NOTIFICATIONS_PER_HOUR = 20;
+
 export function createChatPublicationRequests(db: Db, options: RequestOptions) {
   const { endpointRecord, stageTeamsBoardFileIntent, processPendingSlackBoardMessages, processPendingPublications, prepareTeamsBoardSend } = options;
   async function getPublicationBatchStatus(
@@ -463,5 +468,171 @@ export function createChatPublicationRequests(db: Db, options: RequestOptions) {
       publication
     );
   }
-  return { getPublicationBatchStatus, publishComment, publishBoardMessage };
+
+  /**
+   * Lets the agent assigned to a Telegram endpoint start a message to that
+   * endpoint's sponsor. The destination is resolved here and never accepted from
+   * the caller: only a direct chat with the sponsor's linked Telegram identity
+   * qualifies, so an agent cannot reach anyone else through this path.
+   */
+  async function publishAgentOwnerNotification(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    body: string;
+    idempotencyKey: string;
+  }) {
+    const publication = await db.transaction(async (tx) => {
+      const [target] = await tx
+        .select({ conversation: chatConversations })
+        .from(chatConversations)
+        .innerJoin(
+          chatEndpoints,
+          eq(chatEndpoints.id, chatConversations.endpointId),
+        )
+        .innerJoin(
+          chatIdentityLinks,
+          and(
+            eq(chatIdentityLinks.companyId, chatEndpoints.companyId),
+            eq(chatIdentityLinks.endpointId, chatEndpoints.id),
+            eq(chatIdentityLinks.paperclipUserId, chatEndpoints.sponsorUserId),
+            eq(chatIdentityLinks.status, "linked"),
+            isNull(chatIdentityLinks.revokedAt),
+          ),
+        )
+        .innerJoin(
+          chatExternalPrincipals,
+          and(
+            eq(chatExternalPrincipals.id, chatIdentityLinks.principalId),
+            eq(chatExternalPrincipals.provider, "telegram"),
+            eq(chatExternalPrincipals.isBot, false),
+          ),
+        )
+        .where(
+          and(
+            eq(chatConversations.companyId, input.companyId),
+            eq(chatEndpoints.assignedAgentId, input.agentId),
+            eq(chatEndpoints.provider, "telegram"),
+            inArray(chatEndpoints.status, ["verifying", "active"]),
+            eq(chatEndpoints.allowDirectMessages, true),
+            ne(chatEndpoints.publicationMode, "explicit"),
+            eq(chatConversations.isDirectMessage, true),
+            inArray(chatConversations.state, ["active", "waiting", "completed"]),
+            eq(
+              chatConversations.externalConversationId,
+              sql`'telegram:' || ${chatExternalPrincipals.externalId}`,
+            ),
+          ),
+        )
+        .orderBy(
+          sql`${chatConversations.lastActivityAt} desc nulls last`,
+          desc(chatConversations.createdAt),
+        )
+        .limit(1)
+        .for("update", { of: chatConversations });
+      if (!target) {
+        throw conflict(
+          "No linked Telegram chat with this agent's owner is available; the owner must message the bot first",
+        );
+      }
+      const { conversation } = target;
+      const idempotencyKey = `${AGENT_OWNER_NOTIFICATION_KEY_PREFIX}${conversation.endpointId}:${input.agentId}:${input.idempotencyKey}`;
+      const [existing] = await tx
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.companyId, conversation.companyId),
+            eq(chatPublications.idempotencyKey, idempotencyKey),
+          ),
+        );
+      if (existing) return existing;
+
+      // Parts of one long message share a comment, so count messages, not rows.
+      const [{ sent }] = await tx
+        .select({
+          sent: sql<number>`count(distinct ${chatPublications.commentId})::int`,
+        })
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.companyId, conversation.companyId),
+            eq(chatPublications.endpointId, conversation.endpointId),
+            like(
+              chatPublications.idempotencyKey,
+              `${AGENT_OWNER_NOTIFICATION_KEY_PREFIX}%`,
+            ),
+            gt(chatPublications.createdAt, new Date(Date.now() - 3_600_000)),
+          ),
+        );
+      if (sent >= AGENT_OWNER_NOTIFICATIONS_PER_HOUR) {
+        throw tooManyRequests("Owner notification limit reached; try again later");
+      }
+
+      const comment = await issueService(tx as unknown as Db).addComment(
+        conversation.issueId,
+        input.body,
+        { agentId: input.agentId },
+        { authorType: "agent" },
+        tx,
+      );
+      await notifyChatPublicationWork(tx);
+      const [created] = await tx
+        .insert(chatPublications)
+        .values({
+          companyId: conversation.companyId,
+          endpointId: conversation.endpointId,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          commentId: comment.id,
+          idempotencyKey,
+          payload: projectSafeChatPublication({
+            classification: "external",
+            source: "agent_comment",
+            text: comment.body,
+          }),
+          state: "pending",
+        })
+        .returning();
+      await logActivity(tx as unknown as Db, {
+        companyId: conversation.companyId,
+        actorType: "agent",
+        actorId: input.agentId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "chat.owner_notification_requested",
+        entityType: "chat_publication",
+        entityId: created.id,
+        issueId: conversation.issueId,
+        details: {
+          endpointId: conversation.endpointId,
+          conversationId: conversation.id,
+          commentId: comment.id,
+        },
+      });
+      return created;
+    });
+    await processPendingPublications();
+    const batch = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.endpointId, publication.endpointId),
+          eq(chatPublications.conversationId, publication.conversationId),
+          eq(chatPublications.commentId, publication.commentId!),
+        ),
+      )
+      .orderBy(
+        asc(chatPublications.createdAt),
+        asc(publicationTransportOrderKey(chatPublications)),
+      );
+    return (
+      batch.find((candidate) => candidate.state !== "published") ??
+      batch.at(-1) ??
+      publication
+    );
+  }
+
+  return { getPublicationBatchStatus, publishComment, publishBoardMessage, publishAgentOwnerNotification };
 }

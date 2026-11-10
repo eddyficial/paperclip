@@ -342,6 +342,7 @@ import {
   photonProjectIdSchema,
   photonLineIdSchema,
   publishChatPublicationSchema,
+  notifyChatOwnerSchema,
   resolveChatActionSchema,
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
@@ -3017,6 +3018,28 @@ registry.registerPath({
     404: r.notFound,
     409: r.conflict,
     422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/chat-owner-notifications",
+  tags: ["chat-channels"],
+  summary: "Send a Telegram message to the owner of the calling agent's chat endpoint",
+  description:
+    "Agent runs only. Starts a message to the sponsor of the Telegram endpoint assigned to the calling agent, in that sponsor's linked direct chat. The destination is resolved by the server and cannot be chosen by the caller. Retrying with the same idempotency key does not send again.",
+  request: {
+    params: z.object({ companyId: z.string().uuid() }),
+    body: jsonBody(notifyChatOwnerSchema),
+  },
+  responses: {
+    201: r.ok(chatPublicationResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+    429: { description: "Owner notification limit reached" },
   },
 });
 

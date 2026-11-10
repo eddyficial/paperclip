@@ -1308,6 +1308,109 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     return { companyId, assignedAgentId, replacementAgentId };
   }
 
+  describe("agent messages to the endpoint owner", () => {
+    async function ownerChatFixture() {
+      const fixture = await seedCompany();
+      const { endpoint, service } = await configuredTelegramEndpoint(fixture);
+      await db.update(chatEndpoints)
+        .set({ status: "active", allowDirectMessages: true, sponsorUserId: "owner-user" })
+        .where(eq(chatEndpoints.id, endpoint.id));
+      const providerAccountId = endpoint.providerAccountId ?? "telegram-bot";
+      const [principal] = await db.insert(chatExternalPrincipals).values({
+        companyId: fixture.companyId, provider: "telegram", providerAccountId,
+        externalId: "5551", kind: "user", displayName: "Owner", isBot: false,
+      }).returning();
+      await db.insert(chatIdentityLinks).values({
+        companyId: fixture.companyId, endpointId: endpoint.id, principalId: principal.id,
+        paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date(),
+      });
+      const chat = async (peer: string, lastActivityAt: Date) => {
+        const [issue] = await db.insert(issues)
+          .values({ companyId: fixture.companyId, title: `Chat with ${peer}`, status: "in_progress" }).returning();
+        const [conversation] = await db.insert(chatConversations).values({
+          companyId: fixture.companyId, endpointId: endpoint.id, issueId: issue.id,
+          externalConversationId: `telegram:${peer}`, externalThreadId: `telegram:${peer}`, externalLabel: peer,
+          isDirectMessage: true, state: "active", lastActivityAt,
+        }).returning();
+        return conversation;
+      };
+      const startRun = async (agentId = fixture.assignedAgentId) => {
+        const [run] = await db.insert(heartbeatRuns)
+          .values({ companyId: fixture.companyId, agentId, status: "running", invocationSource: "on_demand" }).returning();
+        return run.id;
+      };
+      const send = async (agentId = fixture.assignedAgentId, idempotencyKey = randomUUID()) =>
+        service.publishAgentOwnerNotification({
+          companyId: fixture.companyId, agentId, runId: await startRun(agentId), body: "The review is ready", idempotencyKey,
+        });
+      return { ...fixture, endpoint, service, principal, chat, send, startRun };
+    }
+
+    it("delivers to the owner's chat and not to a more recent stranger's", async () => {
+      const f = await ownerChatFixture();
+      const owner = await f.chat("5551", new Date(Date.now() - 60_000));
+      await f.chat("9999", new Date());
+      const publication = await f.send();
+      expect(publication).toMatchObject({ conversationId: owner.id, issueId: owner.issueId, state: "published" });
+      const comments = await readIssueCommentsByIssueId(owner.issueId);
+      expect(comments).toEqual([
+        expect.objectContaining({ body: "The review is ready", authorAgentId: f.assignedAgentId }),
+      ]);
+    });
+
+    it("does not send twice for one idempotency key", async () => {
+      const f = await ownerChatFixture();
+      const owner = await f.chat("5551", new Date());
+      const key = randomUUID();
+      const first = await f.send(f.assignedAgentId, key);
+      const second = await f.send(f.assignedAgentId, key);
+      expect(second.id).toBe(first.id);
+      expect(await readIssueCommentsByIssueId(owner.issueId)).toHaveLength(1);
+    });
+
+    it("refuses an agent that is not assigned to the endpoint", async () => {
+      const f = await ownerChatFixture();
+      await f.chat("5551", new Date());
+      await expect(f.send(f.replacementAgentId)).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("refuses once the owner's Telegram link is revoked", async () => {
+      const f = await ownerChatFixture();
+      await f.chat("5551", new Date());
+      await db.update(chatIdentityLinks).set({ status: "revoked", revokedAt: new Date() })
+        .where(eq(chatIdentityLinks.endpointId, f.endpoint.id));
+      await expect(f.send()).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("stops after the hourly limit", async () => {
+      const f = await ownerChatFixture();
+      await f.chat("5551", new Date());
+      for (let index = 0; index < 20; index += 1) await f.send();
+      await expect(f.send()).rejects.toMatchObject({ status: 429 });
+    });
+
+    it("accepts only an agent run through the route", async () => {
+      const f = await ownerChatFixture();
+      await f.chat("5551", new Date());
+      const body = { body: "The review is ready", idempotencyKey: randomUUID() };
+      const url = `/api/companies/${f.companyId}/chat-owner-notifications`;
+      await request(routesApp(db, f.companyId, f.service)).post(url).send(body).expect(403);
+      const agentApp = (runId?: string) => {
+        const app = express();
+        app.use(express.json());
+        app.use((req, _res, next) => {
+          req.actor = { type: "agent", agentId: f.assignedAgentId, companyId: f.companyId, runId, source: "agent_jwt" } as typeof req.actor;
+          next();
+        });
+        app.use("/api", chatChannelRoutes(db, { heartbeat: { wakeup: async () => undefined }, service: f.service }));
+        app.use(errorHandler);
+        return app;
+      };
+      await request(agentApp()).post(url).send(body).expect(403);
+      await request(agentApp(await f.startRun())).post(url).send(body).expect(201);
+    });
+  });
+
   it("tracks the actual Board Teams claim and retires recovery when its receipt commits", async () => {
     const context = await teamsFileAuthorityFixture();
     const errors: unknown[] = [];
